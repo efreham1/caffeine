@@ -98,6 +98,10 @@ import com.google.errorprone.annotations.concurrent.GuardedBy;
  * An in-memory cache implementation that supports full concurrency of retrievals, a high expected
  * concurrency for updates, and multiple ways to bound the cache.
  * <p>
+ * Reference cleanup mode can be controlled via system property:
+ * -Dcaffeine.referenceCleanup=queue (default) - Use ReferenceQueue for efficient GC-driven cleanup
+ * -Dcaffeine.referenceCleanup=poll - Scan and poll references via .get() (no ReferenceQueue needed)
+ * <p>
  * This class is abstract and code generated subclasses provide the complete implementation for a
  * particular configuration. This is to ensure that only the fields and execution paths necessary
  * for a given configuration are used.
@@ -200,6 +204,10 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
    */
 
   static final Logger logger = System.getLogger(BoundedLocalCache.class.getName());
+
+  /** Reference cleanup mode: "queue" uses ReferenceQueue, "poll" scans entries */
+  static final boolean USE_REFERENCE_QUEUE = !"poll".equalsIgnoreCase(
+      System.getProperty("caffeine.referenceCleanup", "queue"));
 
   /** The number of CPUs */
   static final int NCPU = Runtime.getRuntime().availableProcessors();
@@ -454,6 +462,22 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
   @SuppressWarnings({"DataFlowIssue", "NullAway"})
   protected ReferenceQueue<V> valueReferenceQueue() {
     return null;
+  }
+
+  /**
+   * Returns the key reference queue to use for creating references.
+   * Returns null in poll mode to create references without a queue.
+   */
+  protected @Nullable ReferenceQueue<K> keyReferenceQueueForCreation() {
+    return USE_REFERENCE_QUEUE ? keyReferenceQueue() : null;
+  }
+
+  /**
+   * Returns the value reference queue to use for creating references.
+   * Returns null in poll mode to create references without a queue.
+   */
+  protected @Nullable ReferenceQueue<V> valueReferenceQueueForCreation() {
+    return USE_REFERENCE_QUEUE ? valueReferenceQueue() : null;
   }
 
   /* --------------- Expiration Support --------------- */
@@ -1735,12 +1759,22 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     }
   }
 
-  /** Drains the weak key references queue. */
+  /** Drains the weak key references - either via queue or by scanning entries. */
   @GuardedBy("evictionLock")
   void drainKeyReferences() {
     if (!collectKeys()) {
       return;
     }
+    if (USE_REFERENCE_QUEUE) {
+      drainKeyReferencesViaQueue();
+    } else {
+      drainKeyReferencesViaPoll();
+    }
+  }
+
+  /** Drains the weak key references queue (original implementation). */
+  @GuardedBy("evictionLock")
+  void drainKeyReferencesViaQueue() {
     @Var Reference<? extends K> keyRef;
     while ((keyRef = keyReferenceQueue().poll()) != null) {
       Node<K, V> node = data.get(keyRef);
@@ -1750,18 +1784,48 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     }
   }
 
-  /** Drains the weak / soft value references queue. */
+  /** Drains cleared key references by scanning all entries and checking .get(). */
+  @GuardedBy("evictionLock")
+  void drainKeyReferencesViaPoll() {
+    for (Node<K, V> node : data.values()) {
+      if (node.getKey() == null) {
+        evictEntry(node, RemovalCause.COLLECTED, 0L);
+      }
+    }
+  }
+
+  /** Drains the weak / soft value references - either via queue or by scanning entries. */
   @GuardedBy("evictionLock")
   void drainValueReferences() {
     if (!collectValues()) {
       return;
     }
+    if (USE_REFERENCE_QUEUE) {
+      drainValueReferencesViaQueue();
+    } else {
+      drainValueReferencesViaPoll();
+    }
+  }
+
+  /** Drains the weak / soft value references queue (original implementation). */
+  @GuardedBy("evictionLock")
+  void drainValueReferencesViaQueue() {
     @Var Reference<? extends V> valueRef;
     while ((valueRef = valueReferenceQueue().poll()) != null) {
       @SuppressWarnings("unchecked")
       var ref = (InternalReference<V>) valueRef;
       Node<K, V> node = data.get(ref.getKeyReference());
       if ((node != null) && (valueRef == node.getValueReference())) {
+        evictEntry(node, RemovalCause.COLLECTED, 0L);
+      }
+    }
+  }
+
+  /** Drains cleared value references by scanning all entries and checking .get(). */
+  @GuardedBy("evictionLock")
+  void drainValueReferencesViaPoll() {
+    for (Node<K, V> node : data.values()) {
+      if (node.getValue() == null) {
         evictEntry(node, RemovalCause.COLLECTED, 0L);
       }
     }
@@ -2297,8 +2361,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
       @Var Node<K, V> prior = data.get(lookupKey);
       if (prior == null) {
         if (node == null) {
-          node = nodeFactory.newNode(key, keyReferenceQueue(),
-              value, valueReferenceQueue(), newWeight, now);
+          node = nodeFactory.newNode(key, keyReferenceQueueForCreation(),
+              value, valueReferenceQueueForCreation(), newWeight, now);
           long expirationTime = isComputingAsync(value) ? (now + ASYNC_EXPIRY) : now;
           setVariableTime(node, expireAfterCreate(key, value, expiry, now));
           setAccessTime(node, expirationTime);
@@ -2390,7 +2454,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
             setWriteTime(prior, isComputingAsync(value) ? (now + ASYNC_EXPIRY) : now);
           }
 
-          prior.setValue(value, valueReferenceQueue());
+          prior.setValue(value, valueReferenceQueueForCreation());
           prior.setWeight(newWeight);
 
           discardRefresh(prior.getKeyReference());
@@ -2541,7 +2605,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         }
 
         long varTime = expireAfterUpdate(n, key, value, expiry(), now[0]);
-        n.setValue(value, valueReferenceQueue());
+        n.setValue(value, valueReferenceQueueForCreation());
         n.setWeight(weight);
 
         long expirationTime = isComputingAsync(value) ? (now[0] + ASYNC_EXPIRY) : now[0];
@@ -2606,7 +2670,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         }
 
         long varTime = expireAfterUpdate(n, key, newValue, expiry(), now[0]);
-        n.setValue(newValue, valueReferenceQueue());
+        n.setValue(newValue, valueReferenceQueueForCreation());
         n.setWeight(weight);
 
         long expirationTime = isComputingAsync(newValue) ? (now[0] + ASYNC_EXPIRY) : now[0];
@@ -2676,7 +2740,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     if (recordStats) {
       mappingFunction = statsAware(mappingFunction, recordLoad);
     }
-    Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueue());
+    @SuppressWarnings("NullAway")
+    Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueueForCreation());
     return doComputeIfAbsent(key, keyRef, mappingFunction, new long[] { now }, recordStats);
   }
 
@@ -2705,8 +2770,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         }
         now[0] = expirationTicker().read();
         weight[1] = weigher.weigh(key, newValue[0]);
-        var created = nodeFactory.newNode(key, keyReferenceQueue(),
-            newValue[0], valueReferenceQueue(), weight[1], now[0]);
+        var created = nodeFactory.newNode(key, keyReferenceQueueForCreation(),
+            newValue[0], valueReferenceQueueForCreation(), weight[1], now[0]);
         long expirationTime = isComputingAsync(newValue[0]) ? (now[0] + ASYNC_EXPIRY) : now[0];
         setVariableTime(created, expireAfterCreate(key, newValue[0], expiry(), now[0]));
         setAccessTime(created, expirationTime);
@@ -2742,7 +2807,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         weight[1] = weigher.weigh(key, newValue[0]);
         long varTime = expireAfterCreate(key, newValue[0], expiry(), now[0]);
 
-        n.setValue(newValue[0], valueReferenceQueue());
+        n.setValue(newValue[0], valueReferenceQueueForCreation());
         n.setWeight(weight[1]);
 
         long expirationTime = isComputingAsync(newValue[0]) ? (now[0] + ASYNC_EXPIRY) : now[0];
@@ -2816,7 +2881,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     requireNonNull(remappingFunction);
 
     long[] now = { expirationTicker().read() };
-    Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueue());
+    @SuppressWarnings("NullAway")
+    Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueueForCreation());
     BiFunction<? super K, ? super V, ? extends V> statsAwareRemappingFunction =
         statsAware(remappingFunction, recordLoad, recordLoadFailure);
     return remap(key, keyRef, statsAwareRemappingFunction,
@@ -2831,7 +2897,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
     requireNonNull(remappingFunction);
 
     long[] now = { expirationTicker().read() };
-    Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueue());
+    @SuppressWarnings("NullAway")
+    Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueueForCreation());
     BiFunction<? super K, ? super @Nullable V, ? extends @Nullable V> mergeFunction =
         (k, oldValue) -> (oldValue == null)
           ? value
@@ -2885,7 +2952,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         weight[1] = weigher.weigh(key, newValue[0]);
         long varTime = expireAfterCreate(key, newValue[0], expiry, now[0]);
         var created = nodeFactory.newNode(keyRef, newValue[0],
-            valueReferenceQueue(), weight[1], now[0]);
+            valueReferenceQueueForCreation(), weight[1], now[0]);
 
         long expirationTime = isComputingAsync(newValue[0]) ? (now[0] + ASYNC_EXPIRY) : now[0];
         setAccessTime(created, expirationTime);
@@ -2938,7 +3005,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
           varTime = expireAfterCreate(key, newValue[0], expiry, now[0]);
         }
 
-        n.setValue(newValue[0], valueReferenceQueue());
+        n.setValue(newValue[0], valueReferenceQueueForCreation());
         n.setWeight(weight[1]);
 
         long expirationTime = isComputingAsync(newValue[0]) ? (now[0] + ASYNC_EXPIRY) : now[0];
