@@ -102,6 +102,7 @@ private fun disabledChecks() = listOf(
   "StaticImport",
   "SuppressWarningsWithoutExplanation",
   "UngroupedOverloads",
+  "UnnecessarilyFullyQualified",
 )
 @Suppress("CanConvertToMultiDollarString")
 private fun disabledRules() = listOf(
