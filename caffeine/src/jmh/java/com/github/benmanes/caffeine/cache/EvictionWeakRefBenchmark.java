@@ -33,7 +33,7 @@ import com.github.benmanes.caffeine.cache.impl.CaffeineWeakCache;
  * ./gradlew jmh -PincludePattern=EvictionWeakRefBenchmark --rerun
  * }
  *
- * @author ben.manes@gmail.com (Ben Manes)
+ * @author fredrik.hammarberg00@outlook.com (Fredrik Hammarberg)
  */
 @State(Scope.Benchmark)
 @SuppressWarnings({"CanonicalAnnotationSyntax", "LexicographicalAnnotationAttributeListing",

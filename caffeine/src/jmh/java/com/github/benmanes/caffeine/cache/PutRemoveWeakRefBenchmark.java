@@ -48,7 +48,7 @@ import site.ycsb.generator.ScrambledZipfianGenerator;
  * ./gradlew jmh -PincludePattern=PutRemoveWeakRefBenchmark --rerun
  * }
  *
- * @author ben.manes@gmail.com (Ben Manes)
+ * @author fredrik.hammarberg00@outlook.com (Fredrik Hammarberg)
  */
 @State(Scope.Group)
 @SuppressWarnings({"CanonicalAnnotationSyntax", "LexicographicalAnnotationAttributeListing",
